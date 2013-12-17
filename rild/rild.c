@@ -42,7 +42,7 @@
 static void usage(const char *argv0)
 {
     fprintf(stderr, "Usage: %s -l <ril impl library> [-- <args for impl library>]\n", argv0);
-    exit(EXIT_FAILURE);
+    exit(-1);
 }
 
 extern void RIL_register (const RIL_RadioFunctions *callbacks);
@@ -89,56 +89,30 @@ void switchUser() {
     setuid(AID_RADIO);
 
     struct __user_cap_header_struct header;
-    memset(&header, 0, sizeof(header));
-    header.version = _LINUX_CAPABILITY_VERSION_3;
+    struct __user_cap_data_struct cap;
+    header.version = _LINUX_CAPABILITY_VERSION;
     header.pid = 0;
-
-    struct __user_cap_data_struct data[2];
-    memset(&data, 0, sizeof(data));
-
-    data[CAP_TO_INDEX(CAP_NET_ADMIN)].effective |= CAP_TO_MASK(CAP_NET_ADMIN);
-    data[CAP_TO_INDEX(CAP_NET_ADMIN)].permitted |= CAP_TO_MASK(CAP_NET_ADMIN);
-
-    data[CAP_TO_INDEX(CAP_NET_RAW)].effective |= CAP_TO_MASK(CAP_NET_RAW);
-    data[CAP_TO_INDEX(CAP_NET_RAW)].permitted |= CAP_TO_MASK(CAP_NET_RAW);
-
-    if (capset(&header, &data[0]) == -1) {
-        RLOGE("capset failed: %s", strerror(errno));
-        exit(EXIT_FAILURE);
-    }
+    cap.effective = cap.permitted = (1 << CAP_NET_ADMIN) | (1 << CAP_NET_RAW);
+    cap.inheritable = 0;
+    capset(&header, &cap);
 }
 
-//for two rils.
-static const char* enum_port[2] = 
-{
-    "/sys/class/tty/ttyUSB1",
-    "/sys/class/tty/ttyACM1",
-};
 int main(int argc, char **argv)
 {
     const char * rilLibPath = NULL;
     char **rilArgv;
-    void *dlHandle = NULL;
+    void *dlHandle;
     const RIL_RadioFunctions *(*rilInit)(const struct RIL_Env *, int, char **);
     const RIL_RadioFunctions *funcs;
     char libPath[PROPERTY_VALUE_MAX];
     unsigned char hasLibArgs = 0;
-    int ret = 0;
 
     int i;
-	ret = property_get(LIB_PATH_PROPERTY, libPath, NULL);
-	if (ret <= 0) {
-		/* nothing to do */
-    } else {
-        rilLibPath = libPath;
-    }
 
     umask(S_IRGRP | S_IWGRP | S_IXGRP | S_IROTH | S_IWOTH | S_IXOTH);
     for (i = 1; i < argc ;) {
         if (0 == strcmp(argv[i], "-l") && (argc - i > 1)) {
-			if(rilLibPath == NULL){
-				rilLibPath = argv[i + 1];
-			}
+            rilLibPath = argv[i + 1];
             i += 2;
         } else if (0 == strcmp(argv[i], "--")) {
             i++;
@@ -159,18 +133,120 @@ int main(int argc, char **argv)
         }
     }
 
-    //for two rils   
-    if (access(enum_port[0], 0) == 0 || access(enum_port[1], 0) == 0){
-        ALOGD("open libsoftwinner-ril.so");
-        dlHandle = dlopen("/system/lib/libsoftwinner-ril.so", RTLD_NOW);
-    } else {
-        ALOGD("open usiuna-ril.so");
-        dlHandle = dlopen(rilLibPath, RTLD_NOW);
+    /* special override when in the emulator */
+#if 1
+    {
+        static char*  arg_overrides[3];
+        static char   arg_device[32];
+        int           done = 0;
+
+#define  REFERENCE_RIL_PATH  "/system/lib/libreference-ril.so"
+
+        /* first, read /proc/cmdline into memory */
+        char          buffer[1024], *p, *q;
+        int           len;
+        int           fd = open("/proc/cmdline",O_RDONLY);
+
+        if (fd < 0) {
+            RLOGD("could not open /proc/cmdline:%s", strerror(errno));
+            goto OpenLib;
+        }
+
+        do {
+            len = read(fd,buffer,sizeof(buffer)); }
+        while (len == -1 && errno == EINTR);
+
+        if (len < 0) {
+            RLOGD("could not read /proc/cmdline:%s", strerror(errno));
+            close(fd);
+            goto OpenLib;
+        }
+        close(fd);
+
+        if (strstr(buffer, "android.qemud=") != NULL)
+        {
+            /* the qemud daemon is launched after rild, so
+            * give it some time to create its GSM socket
+            */
+            int  tries = 5;
+#define  QEMUD_SOCKET_NAME    "qemud"
+
+            while (1) {
+                int  fd;
+
+                sleep(1);
+
+                fd = qemu_pipe_open("qemud:gsm");
+                if (fd < 0) {
+                    fd = socket_local_client(
+                                QEMUD_SOCKET_NAME,
+                                ANDROID_SOCKET_NAMESPACE_RESERVED,
+                                SOCK_STREAM );
+                }
+                if (fd >= 0) {
+                    close(fd);
+                    snprintf( arg_device, sizeof(arg_device), "%s/%s",
+                                ANDROID_SOCKET_DIR, QEMUD_SOCKET_NAME );
+
+                    arg_overrides[1] = "-s";
+                    arg_overrides[2] = arg_device;
+                    done = 1;
+                    break;
+                }
+                RLOGD("could not connect to %s socket: %s",
+                    QEMUD_SOCKET_NAME, strerror(errno));
+                if (--tries == 0)
+                    break;
+            }
+            if (!done) {
+                RLOGE("could not connect to %s socket (giving up): %s",
+                    QEMUD_SOCKET_NAME, strerror(errno));
+                while(1)
+                    sleep(0x00ffffff);
+            }
+        }
+
+        /* otherwise, try to see if we passed a device name from the kernel */
+        if (!done) do {
+#define  KERNEL_OPTION  "android.ril="
+#define  DEV_PREFIX     "/dev/"
+
+            p = strstr( buffer, KERNEL_OPTION );
+            if (p == NULL)
+                break;
+
+            p += sizeof(KERNEL_OPTION)-1;
+            q  = strpbrk( p, " \t\n\r" );
+            if (q != NULL)
+                *q = 0;
+
+            snprintf( arg_device, sizeof(arg_device), DEV_PREFIX "%s", p );
+            arg_device[sizeof(arg_device)-1] = 0;
+            arg_overrides[1] = "-d";
+            arg_overrides[2] = arg_device;
+            done = 1;
+
+        } while (0);
+
+        if (done) {
+            argv = arg_overrides;
+            argc = 3;
+            i    = 1;
+            hasLibArgs = 1;
+            rilLibPath = REFERENCE_RIL_PATH;
+
+            RLOGD("overriding with %s %s", arg_overrides[1], arg_overrides[2]);
+        }
     }
+OpenLib:
+#endif
+    switchUser();
+
+    dlHandle = dlopen(rilLibPath, RTLD_NOW);
 
     if (dlHandle == NULL) {
         RLOGE("dlopen failed: %s", dlerror());
-        exit(EXIT_FAILURE);
+        exit(-1);
     }
 
     RIL_startEventLoop();
@@ -179,7 +255,7 @@ int main(int argc, char **argv)
 
     if (rilInit == NULL) {
         RLOGE("RIL_Init not defined or exported in %s\n", rilLibPath);
-        exit(EXIT_FAILURE);
+        exit(-1);
     }
 
     if (hasLibArgs) {
@@ -196,19 +272,15 @@ int main(int argc, char **argv)
     // Make sure there's a reasonable argv[0]
     rilArgv[0] = argv[0];
 
-    //for two rils. Is it needed here?
-    if (access(enum_port[0], 0) == 0 || access(enum_port[1], 0) == 0) {
-        ALOGD("3g dongle");
-        rilArgv[2] = "/dev/ttyUSB1"; //?
-    }
-
     funcs = rilInit(&s_rilEnv, argc, rilArgv);
 
     RIL_register(funcs);
 
 done:
 
-    while (true) {
-        sleep(UINT32_MAX);
+    while(1) {
+        // sleep(UINT32_MAX) seems to return immediately on bionic
+        sleep(0x00ffffff);
     }
 }
+
